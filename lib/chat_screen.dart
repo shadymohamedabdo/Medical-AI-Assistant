@@ -1,6 +1,10 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
+
+import 'package:image_picker/image_picker.dart';
+import 'package:nursing_help/shared_pref.dart';
 import 'ai_service.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
@@ -16,9 +20,9 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<Map<String, String>> _messages = [];
   final ScrollController _scrollController = ScrollController();
   bool _isLoading = false;
-  // voice
   late stt.SpeechToText _speech;
   bool _isListening = false;
+  Map<String, String>? _replyToMessage;
 
   final AiService _aiService = AiService();
 
@@ -26,56 +30,119 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _speech = stt.SpeechToText();
-    _loadMessages();
+    _loadOldMessages();
   }
 
-  // load old message
-  Future<void> _loadMessages() async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('chat_history');
+  Future<void> _loadOldMessages() async {
+    final saved = MyPrefs.getString('chat_history');
     if (saved != null) {
       final List decoded = jsonDecode(saved);
       setState(() {
         _messages.addAll(decoded.map((e) => Map<String, String>.from(e)));
       });
-
-      // ✅ بعد ما يحمل الرسائل، ينزل لآخر رسالة
       await Future.delayed(const Duration(milliseconds: 100));
       _scrollToBottom();
     }
   }
 
-  // save message when user Exited the application
   Future<void> _saveMessages() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('chat_history', jsonEncode(_messages));
+    await MyPrefs.setString('chat_history', jsonEncode(_messages));
   }
 
-  // Conversation between user and ai
-  Future<void> sendMessage(String message) async {
-    setState(() {
-      _messages.add({'role': 'user', 'text': message});
-      _isLoading = true;
-    });
+  Future<void> sendMessage(String message, {bool isEdited = false}) async {
+    String finalMessage = message;
 
-    // ✅ ينزل لتحت بعد ما المستخدم يكتب
+    // ✅ لو المستخدم بيرد على رسالة معينة
+    if (_replyToMessage != null) {
+      finalMessage =
+      'الرسالة الأصلية: "${_replyToMessage!['text']}"\n\nرد المستخدم: $message';
+    }
+
+    if (!isEdited) {
+      setState(() {
+        _messages.add({'role': 'user', 'text': message});
+        _isLoading = true;
+      });
+    } else {
+      setState(() {
+        _isLoading = true;
+      });
+    }
+
     _scrollToBottom();
 
-    final reply = await _aiService.getBotReply(message, _messages);
+    // ✅ البوت بيرد بناءً على الرسالة المختارة
+    final reply = await _aiService.getBotReply(finalMessage, _messages);
 
     setState(() {
       _messages.add({'role': 'bot', 'text': reply});
       _isLoading = false;
+      _replyToMessage = null; // ✅ نلغي وضع الرد بعد الإرسال
     });
 
-    // ✅ نحفظ بعد كل رسالة
     await _saveMessages();
-
-    // ✅ بعد ما البوت يرد، ننزل لآخر الرسائل
     _scrollToBottom();
   }
 
-  // 📍 دالة بتنزل لآخر الرسائل
+  void _editMessageDialog(int index, String oldText) {
+    final editController = TextEditingController(text: oldText);
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('✏️ تعديل الرسالة'),
+        content: TextField(
+          controller: editController,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('إلغاء'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.teal),
+            onPressed: () async {
+              final newText = editController.text.trim();
+              if (newText.isEmpty) return;
+              setState(() {
+                _messages[index]['text'] = newText;
+              });
+
+              //بيشوف لو الرسالة اللي بعدها كانت رد البوت، بيحذفها لأن الرد ده خلاص بقى مش مناسب بعد التعديل.
+              if (index + 1 < _messages.length && _messages[index + 1]['role'] == 'bot') {
+                setState(() {
+                  _messages.removeAt(index + 1);
+                });
+              }
+
+              await _saveMessages();
+
+              Navigator.pop(context);
+
+              // 🤖 نخلي البوت يرد على الرسالة المعدّلة
+              await sendMessage(newText, isEdited: true);
+            },
+            child: const Text('تعديل'),
+          ),
+        ],
+      ),
+    );
+  }
+  void _copyBotMessage(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('✅ تم نسخ الرد إلى الحافظة'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
@@ -91,98 +158,246 @@ class _ChatScreenState extends State<ChatScreen> {
   void _listen() async {
     if (!_isListening) {
       bool available = await _speech.initialize(
-        onStatus: (val) {
-          if (val == 'done' || val == 'notListening') {
+        onStatus: (value) {
+          if (value == 'done' || value == 'notListening') {
             setState(() => _isListening = false);
             _speech.stop();
+            // لو المستخدم وقف الكلام نرجع النص فاضي بعد التوقف
+            if (_controller.text == '🎙️ جاري الاستماع...') {
+              _controller.clear();
+            }
           }
         },
-        onError: (_) {},
+        onError: (error) {
+          setState(() => _isListening = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('⚠️ في مشكلة في الميكروفون: ${error.errorMsg}'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+        },
       );
 
       if (available) {
-        setState(() => _isListening = true);
+        setState(() {
+          _isListening = true;
+          _controller.text = '🎙️ جاري الاستماع...'; // ✅ يظهر النص أول ما يبدأ التسجيل
+        });
+
         _speech.listen(
-          listenFor: const Duration(seconds: 30), // أقصى مدة تسجيل
-          pauseFor: const Duration(seconds: 3),   // يتوقف بعد سكوت 3 ثواني
-          localeId: 'ar_EG', // اللغة المصرية/العربية
+          listenFor: const Duration(seconds: 30),
+          pauseFor: const Duration(seconds: 3),
+          localeId: 'ar_EG',
           onResult: (val) {
             if (val.recognizedWords.isNotEmpty) {
-              _controller.value = TextEditingValue(
-                text: val.recognizedWords,
-                selection: TextSelection.fromPosition(
-                  TextPosition(offset: val.recognizedWords.length),
-                ),
-              );
+              setState(() {
+                _controller.value = TextEditingValue(
+                  text: val.recognizedWords,
+                  selection: TextSelection.fromPosition(
+                    TextPosition(offset: val.recognizedWords.length),
+                  ),
+                );
+              });
             }
           },
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('🎤 الميكروفون مش متاح دلوقتي، جرّب تاني.'),
+          ),
         );
       }
     } else {
       setState(() => _isListening = false);
       _speech.stop();
+      _controller.clear(); // 🛑 لو ضغط تاني يوقف التسجيل ويفضي الحقل
     }
   }
 
+  Future<void> _pickImage({required ImageSource source}) async {
+    final ImagePicker picker = ImagePicker();
+    final XFile? image = await picker.pickImage(source: source);
+
+    if (image != null) {
+      setState(() {
+        _messages.add({
+          'role': 'user',
+          'text': '',
+          'imagePath': image.path,
+        });
+      });
+      await _saveMessages();
+      _scrollToBottom();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.grey[100],
       appBar: AppBar(
-        title: const Text('💉 المساعد التمريضي الذكي'),
+        title: const Text('المساعد الطبي الذكي'),
+        titleTextStyle: TextStyle(
+          color: Colors.white,
+          fontSize: 22
+        ),
         backgroundColor: Colors.teal,
         centerTitle: true,
         actions: [
           IconButton(
-            icon: const Icon(Icons.delete_outline),
+            icon: const Icon(Icons.delete),
+            color: Colors.red,
             onPressed: () async {
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.remove('chat_history');
-              setState(() => _messages.clear());
+              final confirm = await showDialog<bool>(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text("تأكيد الحذف"),
+                  content: const Text("هل أنت متأكد إنك عايز تمسح سجل المحادثة بالكامل؟ 😢"),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text("إلغاء"),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      child: const Text(
+                        "مسح",
+                        style: TextStyle(color: Colors.red),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+
+              // لو المستخدم أكد الحذف
+              if (confirm == true) {
+                await MyPrefs.remove('chat_history');
+                setState(() => _messages.clear());
+
+                // رسالة بسيطة بعد الحذف
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text("تم مسح سجل المحادثة بنجاح ✅"),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+              }
             },
           ),
         ],
       ),
       body: Column(
         children: [
+          // listView
           Expanded(
             child: ListView.builder(
-              controller: _scrollController, // ✅ ربط الكنترولر
+              controller: _scrollController,
               padding: const EdgeInsets.all(10),
               itemCount: _messages.length,
               itemBuilder: (_, i) {
                 final msg = _messages[i];
                 final isUser = msg['role'] == 'user';
-                return Align(
-                  alignment:
-                  isUser ? Alignment.centerRight : Alignment.centerLeft,
-                  child: Container(
-                    margin:
-                    const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
-                    padding: const EdgeInsets.symmetric(
-                        vertical: 10, horizontal: 14),
-                    decoration: BoxDecoration(
-                      color: isUser ? Colors.teal[400] : Colors.white,
-                      borderRadius: BorderRadius.only(
-                        topLeft: const Radius.circular(18),
-                        topRight: const Radius.circular(18),
-                        bottomLeft: Radius.circular(isUser ? 18 : 0),
-                        bottomRight: Radius.circular(isUser ? 0 : 18),
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.grey.withValues(alpha: 0.3),
-                          offset: const Offset(1, 2),
-                          blurRadius: 3,
+                return GestureDetector(
+                  onHorizontalDragUpdate: (details) {
+                    // لو المستخدم سحب لليمين مسافة كافية
+                    if (details.delta.dx > 10 && !isUser) {
+                      setState(() {
+                        _replyToMessage = msg;
+                      });
+
+                    }
+                  },
+                  child: Align(
+                    alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                    child: GestureDetector(
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
+                        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+                        decoration: BoxDecoration(
+                          color: isUser ? Colors.teal[400] : Colors.white,
+                          borderRadius: BorderRadius.only(
+                            topLeft: const Radius.circular(18),
+                            topRight: const Radius.circular(18),
+                            bottomLeft: Radius.circular(isUser ? 18 : 0),
+                            bottomRight: Radius.circular(isUser ? 0 : 18),
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.grey.withValues(alpha: 0.3),
+                              offset: const Offset(1, 2),
+                              blurRadius: 3,
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
-                    child: Text(
-                      msg['text']!,
-                      style: TextStyle(
-                        fontSize: 16,
-                        color: isUser ? Colors.white : Colors.black87,
+                        child:
+                        msg.containsKey('imagePath')
+                            ? ClipRRect(
+                          borderRadius: BorderRadius.circular(14),
+                          child: Image.file(
+                            File(msg['imagePath']!),
+                            width: 200,
+                            height: 200,
+                            fit: BoxFit.cover,
+                          ),
+                        )
+                            : isUser
+                            ? Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              msg['text']!,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                              ),
+                            ),
+                            const SizedBox(height: 5),
+                            GestureDetector(
+                              onTap: () {
+                                _editMessageDialog(i, msg['text']!);
+                              },
+                              child:
+                              Icon(Icons.edit, size: 15, color: Colors.white70),
+                            ),
+                          ],
+                        )
+                            : Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SelectableText(
+                              msg['text']!,
+                              style: const TextStyle(
+                                color: Colors.black,
+                                fontSize: 16,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Align(
+                              alignment: Alignment.bottomRight,
+                              child: GestureDetector(
+                                onTap: () => _copyBotMessage(msg['text']!),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: const [
+                                    Icon(Icons.copy, size: 16, color: Colors.grey),
+                                    SizedBox(width: 4),
+                                    Text(
+                                      'نسخ',
+                                      style: TextStyle(
+                                        color: Colors.grey,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -191,17 +406,49 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           if (_isLoading)
+            // loading
             const Padding(
               padding: EdgeInsets.all(8),
               child: CircularProgressIndicator(color: Colors.teal),
             ),
+          if (_replyToMessage != null)
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.teal.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.reply, color: Colors.teal),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _replyToMessage!['text']!.length > 60
+                          ? '${_replyToMessage!['text']!.substring(0, 60)}...'
+                          : _replyToMessage!['text']!,
+                      style: const TextStyle(
+                        color: Colors.black87,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.grey),
+                    onPressed: () => setState(() => _replyToMessage = null),
+                  ),
+                ],
+              ),
+            ),
+
+          // button
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
             child: Row(
               children: [
                 Expanded(
-                  child:
-                  TextField(
+                  child: TextField(
                     controller: _controller,
                     keyboardType: TextInputType.multiline,
                     minLines: 1,
@@ -228,12 +475,32 @@ class _ChatScreenState extends State<ChatScreen> {
                   children: [
                     CircleAvatar(
                       backgroundColor: Colors.teal,
+                      child: PopupMenuButton<String>(
+                        icon:
+                        const Icon(Icons.camera_alt, color: Colors.white),
+                        onSelected: (value) {
+                          if (value == 'camera') {
+                            _pickImage(source: ImageSource.camera);
+                          } else {
+                            _pickImage(source: ImageSource.gallery);
+                          }
+                        },
+                        itemBuilder: (context) => [
+                          const PopupMenuItem(
+                              value: 'camera', child: Text('📸 الكاميرا')),
+                          const PopupMenuItem(
+                              value: 'gallery', child: Text('🖼️ المعرض')),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    CircleAvatar(
+                      backgroundColor: Colors.teal,
                       child: IconButton(
-                        icon:  Icon(
+                        icon: Icon(
                           Icons.mic,
                           color: _isListening ? Colors.red : Colors.white,
                         ),
-
                         onPressed: _listen,
                       ),
                     ),
@@ -259,5 +526,4 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
   }
-
 }

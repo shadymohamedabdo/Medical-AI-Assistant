@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:nursing_help/shared_pref.dart';
 
 import 'chat_screen.dart';
 
-void main() {
+void main() async{
+  WidgetsFlutterBinding.ensureInitialized();
+  await MyPrefs.init(); // نجهز الـ instance هنا
   runApp(const NursingAssistantApp());
 }
 
