@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:dio/dio.dart';
-import 'package:nursing_help/shared_pref.dart';
+import 'package:nursing_help/hive.dart';
 
 class AiService {
   final Dio _dio = Dio();

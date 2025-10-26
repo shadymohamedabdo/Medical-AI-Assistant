@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
-import 'package:nursing_help/shared_pref.dart';
+import 'package:get/get.dart';
+import 'package:nursing_help/chat_controller.dart';
+import 'package:nursing_help/hive.dart';
 
 import 'chat_screen.dart';
 
 void main() async{
+  Get.lazyPut(() => ChatController(), fenix: true);
+
   WidgetsFlutterBinding.ensureInitialized();
   await MyPrefs.init(); // نجهز الـ instance هنا
   runApp(const NursingAssistantApp());
@@ -14,8 +18,7 @@ class NursingAssistantApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Nursing Assistant Bot',
+    return GetMaterialApp(
       debugShowCheckedModeBanner: false,
         home: Directionality(
           textDirection: TextDirection.rtl,
