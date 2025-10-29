@@ -15,7 +15,7 @@ class ChatScreen extends StatelessWidget {
       backgroundColor: Colors.grey[100],
       appBar: AppBar(
         title: const Text('المساعد الطبي الذكي'),
-        titleTextStyle: const TextStyle(color: Colors.white, fontSize: 22),
+        titleTextStyle: const TextStyle(color: Colors.white, fontSize: 22,fontWeight: FontWeight.bold),
         backgroundColor: Colors.teal,
         centerTitle: true,
         actions: [

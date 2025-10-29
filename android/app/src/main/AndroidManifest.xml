@@ -8,7 +8,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
-        android:label="Nursing Ai"
+        android:label="Medical Ai"
         android:icon="@mipmap/nurse">
 
         <activity

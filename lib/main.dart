@@ -6,9 +6,9 @@ import 'package:nursing_help/hive.dart';
 import 'chat_screen.dart';
 
 void main() async{
+  WidgetsFlutterBinding.ensureInitialized();
   Get.lazyPut(() => ChatController(), fenix: true);
 
-  WidgetsFlutterBinding.ensureInitialized();
   await MyPrefs.init(); // نجهز الـ instance هنا
   runApp(const NursingAssistantApp());
 }
