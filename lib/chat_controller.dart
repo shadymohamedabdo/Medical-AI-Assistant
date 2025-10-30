@@ -9,7 +9,8 @@ import 'package:nursing_help/hive.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'ai_service.dart';
 
-class ChatController extends GetxController{
+class ChatController extends GetxController {
+  // UI
   final RxList<Map<String, String>> messages = <Map<String, String>>[].obs;
   final RxBool isLoading = false.obs;
   final RxBool isListening = false.obs;
@@ -17,18 +18,30 @@ class ChatController extends GetxController{
 
   final TextEditingController controller = TextEditingController();
   final ScrollController scrollController = ScrollController();
-  late stt.SpeechToText speech;
-  final AiService aiService = AiService();
-   String kChatHistory = 'chat_history';
 
+  // Services
+  final AiService aiService = AiService();
+  late stt.SpeechToText speech;
+
+  // Storage
+  final RxList<Map<String, dynamic>> allChats = <Map<String, dynamic>>[].obs;
 
   @override
   void onInit() {
     super.onInit();
     speech = stt.SpeechToText();
-    loadOldMessages();
-
+    _initializeChats();
   }
+
+  Future<void> _initializeChats() async {
+    await loadAllChats();
+    if (allChats.isEmpty) {
+      await startNewChat();
+    } else {
+      await loadLastChat();
+    }
+  }
+
   @override
   void onClose() {
     scrollController.dispose();
@@ -36,32 +49,267 @@ class ChatController extends GetxController{
     super.onClose();
   }
 
-  Future<void> loadOldMessages() async {
+  // JSON Helpers
+  Map<String, dynamic> _messageToJson(Map<String, String> msg) => Map<String, dynamic>.from(msg);
+  Map<String, String> _messageFromJson(Map<String, dynamic> json) => json.map((k, v) => MapEntry(k, v.toString()));
+  List<Map<String, dynamic>> _messagesToJson(List<Map<String, String>> msgs) => msgs.map(_messageToJson).toList();
+  List<Map<String, String>> _messagesFromJson(List<dynamic> list) =>
+      list.cast<Map<String, dynamic>>().map(_messageFromJson).toList();
+
+  // Load & Save
+  Future<void> loadAllChats() async {
+    final saved = MyPrefs.getString('all_chats');
+    if (saved == null) return;
+
     try {
-      final saved = MyPrefs.getString(kChatHistory);
-      if (saved != null) {
-        final List decoded = jsonDecode(saved);
-        messages.addAll(decoded.map((e) => Map<String, String>.from(e)));
-        scrollToBottom();
-      }
+      final List<dynamic> decoded = jsonDecode(saved);
+      allChats.value = decoded.map((e) {
+        final map = Map<String, dynamic>.from(e);
+        final msgs = map['messages'] as List<dynamic>? ?? [];
+        map['messages'] = _messagesFromJson(msgs);
+        return map;
+      }).toList();
     } catch (e) {
-      mySnackBar(message: '⚠️ خطأ في تحميل سجل المحادثات', color: Colors.red);
+      allChats.clear();
     }
   }
 
-  Future<void> saveMessages() async {
-    if (messages.isEmpty) return;
-    if (messages.length > 100) {
-      final oldMessages = messages.sublist(0, messages.length - 100);
-      for (var msg in oldMessages) {
-        if (msg.containsKey('imagePath')) {
-          await File(msg['imagePath']!).delete(); // حذف الصور القديمة
-        }
-      }
-      messages.removeRange(0, messages.length - 100);
+  Future<void> saveAllChats() async {
+    final List<Map<String, dynamic>> toSave = allChats.map((chat) {
+      final copy = Map<String, dynamic>.from(chat);
+      copy['messages'] = _messagesToJson(chat['messages'] as List<Map<String, String>>);
+      return copy;
+    }).toList();
+    await MyPrefs.setString('all_chats', jsonEncode(toSave));
+  }
+
+  // Chat Management
+  Future<void> loadLastChat() async {
+    if (allChats.isNotEmpty) {
+      openChat(allChats.last);
     }
-    await MyPrefs.setString(kChatHistory, jsonEncode(messages));
-  }  void scrollToBottom() {
+  }
+
+  void openChat(Map<String, dynamic> chat) {
+    // احفظ الحالية
+    if (allChats.isNotEmpty && messages.isNotEmpty) {
+      allChats.last['messages'] = List<Map<String, String>>.from(messages);
+    }
+
+    // اجعل المحادثة المختارة = last
+    allChats.remove(chat);
+    allChats.add(chat);
+
+    // افتح الرسائل
+    messages.value = _messagesFromJson(chat['messages'] as List<dynamic>);
+    saveAllChats(); // احفظ الترتيب
+    scrollToBottom();
+  }
+
+  Future<void> startNewChat() async {
+    if (allChats.isNotEmpty && messages.isNotEmpty) {
+      allChats.last['messages'] = List<Map<String, String>>.from(messages);
+      await saveAllChats();
+    }
+
+    messages.clear();
+    final newChat = {
+      "id": DateTime.now().millisecondsSinceEpoch.toString(),
+      "title": "محادثة جديدة",
+      "messages": <Map<String, String>>[],
+    };
+    allChats.add(newChat);
+    await saveAllChats();
+  }
+
+  // Send Message
+  Future<void> sendMessage(String message, {bool isEdited = false}) async {
+    final trimmed = message.trim();
+    if (trimmed.isEmpty) return;
+
+    String finalMessage = trimmed;
+    if (replyToMessage.value != null) {
+      final orig = replyToMessage.value!['text']!;
+      finalMessage = 'الرسالة الأصلية: "$orig"\n\nرد المستخدم: $trimmed';
+    }
+
+    if (allChats.isEmpty) await startNewChat();
+
+    if (messages.isEmpty && allChats.isNotEmpty) {
+      String title = trimmed;
+      if (title.length > 25) title = '${title.substring(0, 25)}...';
+      allChats.last['title'] = title;
+    }
+
+    if (!isEdited) {
+      messages.add({'role': 'user', 'text': trimmed});
+    }
+
+    isLoading.value = true;
+    scrollToBottom();
+
+    try {
+      final reply = await aiService.getBotReply(finalMessage, messages);
+      messages.add({'role': 'bot', 'text': reply});
+    } catch (e) {
+      messages.add({'role': 'bot', 'text': 'حدث خطأ، حاول مرة أخرى.'});
+    } finally {
+      isLoading.value = false;
+      replyToMessage.value = null;
+    }
+
+    allChats.last['messages'] = List<Map<String, String>>.from(messages);
+    await saveAllChats();
+    scrollToBottom();
+  }
+
+  // Edit
+  void editMessage(int index, String oldText) {
+    final editCtrl = TextEditingController(text: oldText);
+    Get.defaultDialog(
+      title: "تعديل الرسالة",
+      radius: 15,
+      content: Column(
+        children: [
+          TextField(
+            controller: editCtrl,
+            maxLines: 3,
+            decoration: const InputDecoration(
+              hintText: "الرسالة الجديدة...",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(onPressed: () => Get.back(), child: const Text("إلغاء")),
+              const SizedBox(width: 10),
+              TextButton(
+                style: TextButton.styleFrom(foregroundColor: Colors.teal),
+                onPressed: () async {
+                  final newText = editCtrl.text.trim();
+                  if (newText.isEmpty || newText == oldText) {
+                    Get.back();
+                    return;
+                  }
+
+                  messages[index]['text'] = newText;
+                  if (index + 1 < messages.length && messages[index + 1]['role'] == 'bot') {
+                    messages.removeAt(index + 1);
+                  }
+
+                  allChats.last['messages'] = List<Map<String, String>>.from(messages);
+                  await saveAllChats();
+                  Get.back();
+
+                  await sendMessage(newText, isEdited: true);
+                  mySnackBar(message: 'تم التعديل', color: Colors.green);
+                },
+                child: const Text("تعديل", style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Copy
+  void copyBotMessage(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    mySnackBar(message: 'تم النسخ', color: Colors.green);
+  }
+
+  // Voice
+  void listen() async {
+    if (isListening.value) {
+      isListening.value = false;
+      speech.stop();
+      if (controller.text == 'جاري الاستماع...') controller.clear();
+      return;
+    }
+
+    final ok = await speech.initialize(
+      onStatus: (s) {
+        if (s == 'done' || s == 'notListening') {
+          isListening.value = false;
+          if (controller.text == 'جاري الاستماع...') controller.clear();
+        }
+      },
+      onError: (e) => mySnackBar(message: 'خطأ الميكروفون', color: Colors.red),
+    );
+
+    if (!ok) {
+      mySnackBar(message: 'الميكروفون غير متاح', color: Colors.red);
+      return;
+    }
+
+    isListening.value = true;
+    controller.text = 'جاري الاستماع...';
+    speech.listen(
+      localeId: 'ar_EG',
+      listenFor: const Duration(seconds: 30),
+      pauseFor: const Duration(seconds: 3),
+      onResult: (r) {
+        if (r.recognizedWords.isNotEmpty) {
+          controller.text = r.recognizedWords;
+          controller.selection = TextSelection.fromPosition(
+            TextPosition(offset: r.recognizedWords.length),
+          );
+        }
+      },
+    );
+  }
+
+  // Image
+  Future<void> pickImage({required ImageSource source}) async {
+    final xFile = await ImagePicker().pickImage(source: source);
+    if (xFile == null) return;
+
+    final compressed = await FlutterImageCompress.compressAndGetFile(
+      xFile.path,
+      "${xFile.path}_c.jpg",
+      quality: 70,
+    );
+
+    if (compressed == null) return;
+
+    messages.add({
+      'role': 'user',
+      'text': '',
+      'imagePath': compressed.path,
+    });
+
+    allChats.last['messages'] = List<Map<String, String>>.from(messages);
+    await saveAllChats();
+    scrollToBottom();
+  }
+
+  // Delete All
+  Future<void> deleteChat() async {
+    await MyPrefs.remove('all_chats');
+    allChats.clear();
+    messages.clear();
+    await startNewChat();
+    mySnackBar(message: 'تم مسح السجل', color: const Color(0xFFEF5350));
+  }
+
+  // Delete By ID
+  Future<void> deleteChatById(String id) async {
+    final wasCurrent = allChats.isNotEmpty && allChats.last['id'] == id;
+    allChats.removeWhere((c) => c['id'] == id);
+    await saveAllChats();
+
+    if (allChats.isEmpty) {
+      await startNewChat();
+    } else if (wasCurrent) {
+      openChat(allChats.last);
+    }
+  }
+
+  // Scroll
+  void scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (scrollController.hasClients) {
         scrollController.animateTo(
@@ -73,190 +321,15 @@ class ChatController extends GetxController{
     });
   }
 
-  Future<void> sendMessage(String message, {bool isEdited = false}) async {
-
-    String finalMessage = message;
-    // ✅ لو المستخدم بيرد على رسالة معينة
-    if (replyToMessage.value != null) {
-      finalMessage =
-      'الرسالة الأصلية: "${replyToMessage.value!['text']}"\n\nرد المستخدم: $message';
-    }
-
-    if (!isEdited) {
-      messages.add({'role': 'user', 'text': message});
-      isLoading.value = true;
-    } else {
-      isLoading.value = true;
-    }
-    scrollToBottom();
-    // ✅ البوت بيرد بناءً على الرسالة المختارة
-    final reply = await aiService.getBotReply(finalMessage, messages);
-    messages.add({'role': 'bot', 'text': reply});
-    isLoading.value = false;
-    replyToMessage.value = null; // ✅ نلغي وضع الرد بعد الإرسال
-    await saveMessages();
-    scrollToBottom();
-  }
-
-  void editMessage(int index, String oldText) {
-    final editController = TextEditingController(text: oldText);
-
-    Get.defaultDialog(
-      title: "✏️ تعديل الرسالة",
-      titleStyle: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-      radius: 15,
-      content: Column(
-        children: [
-          TextField(
-            controller: editController,
-            maxLines: 3,
-            decoration: const InputDecoration(
-              hintText: "اكتب الرسالة الجديدة هنا...",
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 20),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              // زر إلغاء
-              TextButton(
-                child: const Text("إلغاء"),
-                onPressed: () {
-                  Get.back();
-                },
-              ),
-              const SizedBox(width: 10),
-              // زر تعديل (نفس شكل زر حذف لكن بلون تركوازي)
-              TextButton(
-                child: const Text(
-                  "تعديل",
-                  style: TextStyle(
-                    color: Colors.teal, // اللون الأساسي عندك
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                onPressed: () async {
-                  final newText = editController.text.trim();
-                  if (newText.isEmpty || newText == oldText) return;
-                  messages[index]['text'] = newText;
-
-                  // لو الرسالة اللي بعدها من البوت، نحذفها لأنها خلاص مش مناسبة بعد التعديل
-                  if (index + 1 < messages.length &&
-                      messages[index + 1]['role'] == 'bot') {
-                    messages.removeAt(index + 1);
-                  }
-
-                  await saveMessages();
-                  Get.back(); // يقفل الديالوج
-
-                  // نخلي البوت يرد على الرسالة المعدلة
-                  await sendMessage(newText, isEdited: true);
-                  mySnackBar(message: 'تم تعديل الرسالة بنجاح ✅', color: Colors.green);
-                  },
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-
-  void copyBotMessage(String text) async {
-    await Clipboard.setData(ClipboardData(text: text));
-    mySnackBar(message: '✅ تم نسخ الرد إلى الحافظة', color: Colors.green);
-
-  }
-
-  void listen() async {
-    if (!isListening.value) {
-      bool available = await speech.initialize(
-
-        onStatus: (value) {
-
-          if (value == 'done' || value == 'notListening') {
-          isListening.value = false;
-            speech.stop();
-            // لو المستخدم وقف الكلام نرجع النص فاضي بعد التوقف
-            if (controller.text == '🎙️ جاري الاستماع...') {
-              controller.clear();
-            }
-          }
-        },
-        onError: (error) {
-        isListening.value = false;
-        mySnackBar(message: '⚠️ في مشكلة في الميكروفون: ${error.errorMsg}', color: Colors.green);
-
-        },
-      );
-
-      if (available) {
-          isListening.value = true;
-          controller.text = '🎙️ جاري الاستماع...'; // ✅ يظهر النص أول ما يبدأ التسجيل
-        speech.listen(
-          listenFor: const Duration(seconds: 30),
-          pauseFor: const Duration(seconds: 3),
-          localeId: 'ar_EG',
-          onResult: (val) {
-            if (val.recognizedWords.isNotEmpty) {
-                controller.value = TextEditingValue(
-                  text: val.recognizedWords,
-                  selection: TextSelection.fromPosition(
-                    TextPosition(offset: val.recognizedWords.length),
-                  ),
-                );
-            }
-          },
-        );
-      } else {
-        mySnackBar(message: '🎤 الميكروفون مش متاح دلوقتي، جرّب تاني.', color: Colors.red);
-
-      }
-    } else {
-     isListening.value = false;
-      speech.stop();
-      controller.clear(); // 🛑 لو ضغط تاني يوقف التسجيل ويفضي الحقل
-    }
-  }
-  Future<void> pickImage({required ImageSource source}) async {
-    final ImagePicker picker = ImagePicker();
-    final XFile? image = await picker.pickImage(source: source);
-    if (image != null) {
-      final compressedImage = await FlutterImageCompress.compressAndGetFile(
-        image.path,
-        "${image.path}_compressed.jpg",
-        quality: 70,
-      );
-      messages.add({
-        'role': 'user',
-        'text': '',
-        'imagePath': compressedImage!.path,
-      });
-      await saveMessages();
-      scrollToBottom();
-    }
-  }  Future<void> deleteChat() async {
-    await MyPrefs.remove('chat_history');
-    messages.clear();
-  }
-  void mySnackBar({required String message,required Color color}) {
+  // SnackBar
+  void mySnackBar({required String message, required Color color}) {
     Get.rawSnackbar(
-      messageText:  Center(
-        child: Text(
-          message,
-          style: TextStyle(
-            color: Colors.white,
-          ),
-        ),
-      ),
+      messageText: Center(child: Text(message, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600))),
       backgroundColor: color,
       snackPosition: SnackPosition.BOTTOM,
-      duration: const Duration(seconds: 1),
+      duration: const Duration(seconds: 2),
       borderRadius: 0,
       margin: EdgeInsets.zero,
     );
   }
-
-
 }
